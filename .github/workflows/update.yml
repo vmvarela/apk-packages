@@ -45,11 +45,21 @@ jobs:
             fi
           done
 
-      - name: Generate APKINDEX (Alpine Docker)
+      - name: Generate and sign APKINDEX (Alpine Docker)
+        env:
+          APK_SIGNING_KEY: ${{ secrets.APK_SIGNING_KEY }}
+          APK_SIGNING_KEY_PUB: ${{ secrets.APK_SIGNING_KEY_PUB }}
         run: |
           # nfpm APKs lack builddate/origin in .PKGINFO, so apk index omits t:/o:.
-          # We post-process the APKINDEX inside the container to add them before
-          # repacking, so Alpine's apk accepts the resulting tar.gz as valid.
+          # We post-process the APKINDEX inside the container to add them.
+          # We also use abuild-sign (inside the same container) for signing because
+          # it produces the exact single-stream tar.gz format apk-tools 3.x requires.
+          if [ -n "${APK_SIGNING_KEY}" ]; then
+            printf '%s\n' "${APK_SIGNING_KEY}" > /tmp/vmvarela.rsa
+            printf '%s\n' "${APK_SIGNING_KEY_PUB}" > /tmp/vmvarela.rsa.pub
+            chmod 600 /tmp/vmvarela.rsa
+          fi
+
           cat > /tmp/make_apkindex.sh << 'SCRIPT'
           #!/bin/sh
           set -e
@@ -60,6 +70,7 @@ jobs:
               echo "No .apk files in ${ARCH}, skipping"
               continue
             fi
+
             # Generate raw APKINDEX (allow-untrusted = skip package sig check)
             apk --allow-untrusted index \
               --description "vmvarela APK repository" \
@@ -67,12 +78,11 @@ jobs:
               -o /tmp/APKINDEX_raw.tar.gz \
               /repo/${ARCH}/*.apk
 
-            # Extract, patch missing fields, repack
+            # Extract, patch missing fields (t: and o:), repack
             mkdir -p /tmp/apkwork && cd /tmp/apkwork
             tar -xzf /tmp/APKINDEX_raw.tar.gz
 
-            # Add o: (origin = pkgname) and t: (build timestamp) after m: line
-            # These are absent from nfpm-generated .PKGINFO but required by apk
+            # Add o: (origin=pkgname) and t: (build timestamp) after m: line
             awk -v ts="${TS}" '
               /^P:/ { pkgname=substr($0,3) }
               /^m:/ { print; printf "o:%s\nt:%s\n", pkgname, ts; next }
@@ -80,76 +90,42 @@ jobs:
             ' APKINDEX > APKINDEX.new && mv APKINDEX.new APKINDEX
 
             tar -czf "/repo/${ARCH}/APKINDEX.tar.gz" DESCRIPTION APKINDEX
-            echo "Created APKINDEX for ${ARCH}: $(wc -c < /repo/${ARCH}/APKINDEX.tar.gz) bytes"
+            echo "Generated APKINDEX for ${ARCH}: $(wc -c < /repo/${ARCH}/APKINDEX.tar.gz) bytes"
             cd /
+
+            # Sign with abuild-sign (produces the exact single-stream format apk 3.x requires)
+            if [ -f /keys/vmvarela.rsa ]; then
+              abuild-sign -q \
+                -k /keys/vmvarela.rsa \
+                -p vmvarela.rsa.pub \
+                "/repo/${ARCH}/APKINDEX.tar.gz"
+              echo "Signed APKINDEX for ${ARCH}: $(wc -c < /repo/${ARCH}/APKINDEX.tar.gz) bytes"
+            else
+              echo "::warning::APK_SIGNING_KEY not set — APKINDEX will be unsigned"
+            fi
           done
           SCRIPT
           chmod +x /tmp/make_apkindex.sh
 
+          # Distribute public key alongside the index
+          if [ -f /tmp/vmvarela.rsa.pub ]; then
+            cp /tmp/vmvarela.rsa.pub "${GITHUB_WORKSPACE}/site/vmvarela.rsa.pub"
+          fi
+
+          KEY_MOUNT=""
+          if [ -f /tmp/vmvarela.rsa ]; then
+            KEY_MOUNT="-v /tmp/vmvarela.rsa:/keys/vmvarela.rsa:ro -v /tmp/vmvarela.rsa.pub:/keys/vmvarela.rsa.pub:ro"
+          fi
+
           docker run --rm \
             -v "${GITHUB_WORKSPACE}/site:/repo" \
             -v "/tmp/make_apkindex.sh:/make_apkindex.sh:ro" \
-            alpine:latest sh /make_apkindex.sh
+            ${KEY_MOUNT} \
+            alpine:latest sh -c "apk add --quiet abuild && sh /make_apkindex.sh"
 
           # Fix ownership (Docker container runs as root)
           sudo chown -R "${USER}:${USER}" "${GITHUB_WORKSPACE}/site/"
           ls -laR site/
-
-      - name: Sign APKINDEX
-        env:
-          APK_SIGNING_KEY: ${{ secrets.APK_SIGNING_KEY }}
-          APK_SIGNING_KEY_PUB: ${{ secrets.APK_SIGNING_KEY_PUB }}
-        run: |
-          if [ -z "${APK_SIGNING_KEY}" ]; then
-            echo "::warning::APK_SIGNING_KEY not set — APKINDEX will be unsigned"
-            exit 0
-          fi
-
-          KEY_FILE="/tmp/vmvarela.rsa"
-          printf '%s\n' "${APK_SIGNING_KEY}" > "${KEY_FILE}"
-          chmod 600 "${KEY_FILE}"
-
-          # Distribute public key
-          printf '%s\n' "${APK_SIGNING_KEY_PUB}" > site/vmvarela.rsa.pub
-
-          # Python script: sign the gzip bytes (SHA1+RSA), then repack into a
-          # single tar.gz stream — sig entry first, then original entries.
-          # abuild-sign produces this exact format; two-stream concatenation
-          # (the previous approach) is rejected by apk-tools 3.x.
-          cat > /tmp/sign_apkindex.py << 'PYEOF'
-          import tarfile, io, subprocess, sys, os
-          key_file, pub_name, index_path = sys.argv[1], sys.argv[2], sys.argv[3]
-
-          # Sign the unsigned APKINDEX.tar.gz (gzip bytes)
-          sig_file = '/tmp/apk.sig'
-          subprocess.run(
-              ['openssl', 'dgst', '-sha1', '-sign', key_file, '-out', sig_file, index_path],
-              check=True)
-          sig = open(sig_file, 'rb').read()
-          orig = open(index_path, 'rb').read()
-
-          # Build single gzip+tar stream: .SIGN.RSA.<pubname> then original entries
-          buf = io.BytesIO()
-          with tarfile.open(fileobj=buf, mode='w:gz') as out:
-              info = tarfile.TarInfo(f'.SIGN.RSA.{pub_name}')
-              info.size = len(sig)
-              out.addfile(info, io.BytesIO(sig))
-              with tarfile.open(fileobj=io.BytesIO(orig), mode='r:gz') as src:
-                  for m in src.getmembers():
-                      data = src.extractfile(m).read()
-                      ti = tarfile.TarInfo(m.name)
-                      ti.size = len(data)
-                      out.addfile(ti, io.BytesIO(data))
-
-          open(index_path, 'wb').write(buf.getvalue())
-          print(f"Signed {index_path}: {len(buf.getvalue())} bytes")
-          PYEOF
-
-          for ARCH in x86_64 aarch64; do
-            INDEX="site/${ARCH}/APKINDEX.tar.gz"
-            [ -f "${INDEX}" ] || continue
-            python3 /tmp/sign_apkindex.py "${KEY_FILE}" vmvarela.rsa.pub "${INDEX}"
-          done
 
       - name: Create index page
         run: |
