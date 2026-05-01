@@ -1,0 +1,131 @@
+name: Update APK Repository
+
+on:
+  repository_dispatch:
+    types: [update-sql-pipe]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (without v, e.g. 0.3.0)"
+        required: true
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build-and-deploy:
+    name: Build and deploy APK repository
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    permissions:
+      pages: write
+      id-token: write
+
+    steps:
+      - name: Resolve version
+        id: vars
+        run: |
+          VERSION="${{ github.event.client_payload.version || github.event.inputs.version }}"
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Download .apk packages
+        run: |
+          VERSION="${{ steps.vars.outputs.version }}"
+          mkdir -p site/x86_64 site/aarch64
+          for GOARCH_APK in "amd64:x86_64" "arm64:aarch64"; do
+            GOARCH="${GOARCH_APK%%:*}"
+            APK_ARCH="${GOARCH_APK##*:}"
+            FILE="sql-pipe_${VERSION}_linux_${GOARCH}.apk"
+            URL="https://github.com/vmvarela/sql-pipe/releases/download/v${VERSION}/${FILE}"
+            if curl -fsSL "${URL}" -o "site/${APK_ARCH}/${FILE}" 2>/dev/null; then
+              echo "Downloaded ${FILE} -> ${APK_ARCH}"
+            else
+              echo "Skipped ${FILE} (not available)"
+            fi
+          done
+
+      - name: Generate APKINDEX and sign
+        env:
+          APK_SIGNING_KEY: ${{ secrets.APK_SIGNING_KEY }}
+          APK_SIGNING_KEY_PUB: ${{ secrets.APK_SIGNING_KEY_PUB }}
+        run: |
+          # Use Alpine Docker container for apk tooling
+          docker run --rm \
+            -v "${{ github.workspace }}/site:/repo" \
+            -e APK_SIGNING_KEY="${APK_SIGNING_KEY}" \
+            -e APK_SIGNING_KEY_PUB="${APK_SIGNING_KEY_PUB}" \
+            alpine:latest sh << 'ALPINE'
+          apk add --no-cache abuild
+
+          for ARCH in x86_64 aarch64; do
+            cd /repo/${ARCH}
+            APKS=$(ls *.apk 2>/dev/null || echo "")
+            if [ -z "${APKS}" ]; then
+              echo "No .apk files in ${ARCH}, skipping"
+              cd /repo
+              continue
+            fi
+
+            if [ -n "${APK_SIGNING_KEY}" ]; then
+              KEY_FILE="/tmp/vmvarela.rsa"
+              echo "${APK_SIGNING_KEY}" > "${KEY_FILE}"
+              chmod 600 "${KEY_FILE}"
+              # Key name used by abuild-sign must match the .pub filename
+              abuild-keygen -a -n -q 2>/dev/null || true
+              apk index \
+                --rewrite-arch ${ARCH} \
+                -o APKINDEX.tar.gz \
+                ${APKS}
+              abuild-sign -k "${KEY_FILE}" APKINDEX.tar.gz
+              # Copy public key for users
+              if [ -n "${APK_SIGNING_KEY_PUB}" ]; then
+                echo "${APK_SIGNING_KEY_PUB}" > /repo/vmvarela.rsa.pub
+              fi
+            else
+              apk index \
+                --rewrite-arch ${ARCH} \
+                -o APKINDEX.tar.gz \
+                ${APKS}
+              echo "::warning::APK_SIGNING_KEY not set — APKINDEX will be unsigned"
+            fi
+            cd /repo
+          done
+          ALPINE
+
+      - name: Create index page
+        run: |
+          cat > site/index.html << 'HTML'
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+            <meta charset="utf-8">
+            <title>vmvarela APK repository</title>
+          </head>
+          <body>
+          <h1>vmvarela APK repository</h1>
+          <h2>Installation (Alpine Linux)</h2>
+          <pre>
+          wget -qO /etc/apk/keys/vmvarela.rsa.pub \
+            https://vmvarela.github.io/apk-packages/vmvarela.rsa.pub
+          echo "https://vmvarela.github.io/apk-packages" >> /etc/apk/repositories
+          apk update &amp;&amp; apk add sql-pipe
+          </pre>
+          <h2>Packages</h2>
+          <ul>
+            <li><a href="https://github.com/vmvarela/sql-pipe">sql-pipe</a> — Read CSV from stdin, query with SQL, write CSV to stdout</li>
+          </ul>
+          </body>
+          </html>
+          HTML
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site/
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
