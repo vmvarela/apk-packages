@@ -47,21 +47,41 @@ jobs:
 
       - name: Generate APKINDEX (Alpine Docker)
         run: |
-          # Write script as a file — more reliable than Docker heredoc
+          # nfpm APKs lack builddate/origin in .PKGINFO, so apk index omits t:/o:.
+          # We post-process the APKINDEX inside the container to add them before
+          # repacking, so Alpine's apk accepts the resulting tar.gz as valid.
           cat > /tmp/make_apkindex.sh << 'SCRIPT'
           #!/bin/sh
           set -e
+          TS=$(date +%s)
           for ARCH in x86_64 aarch64; do
             APK_COUNT=$(ls /repo/${ARCH}/*.apk 2>/dev/null | wc -l)
             if [ "${APK_COUNT}" -eq 0 ]; then
               echo "No .apk files in ${ARCH}, skipping"
               continue
             fi
+            # Generate raw APKINDEX (allow-untrusted = skip package sig check)
             apk --allow-untrusted index \
+              --description "vmvarela APK repository" \
               --rewrite-arch "${ARCH}" \
-              -o "/repo/${ARCH}/APKINDEX.tar.gz" \
+              -o /tmp/APKINDEX_raw.tar.gz \
               /repo/${ARCH}/*.apk
-            echo "Created APKINDEX for ${ARCH} ($(wc -c < /repo/${ARCH}/APKINDEX.tar.gz) bytes)"
+
+            # Extract, patch missing fields, repack
+            mkdir -p /tmp/apkwork && cd /tmp/apkwork
+            tar -xzf /tmp/APKINDEX_raw.tar.gz
+
+            # Add o: (origin = pkgname) and t: (build timestamp) after m: line
+            # These are absent from nfpm-generated .PKGINFO but required by apk
+            awk -v ts="${TS}" '
+              /^P:/ { pkgname=substr($0,3) }
+              /^m:/ { print; printf "o:%s\nt:%s\n", pkgname, ts; next }
+              { print }
+            ' APKINDEX > APKINDEX.new && mv APKINDEX.new APKINDEX
+
+            tar -czf "/repo/${ARCH}/APKINDEX.tar.gz" DESCRIPTION APKINDEX
+            echo "Created APKINDEX for ${ARCH}: $(wc -c < /repo/${ARCH}/APKINDEX.tar.gz) bytes"
+            cd /
           done
           SCRIPT
           chmod +x /tmp/make_apkindex.sh
