@@ -112,20 +112,43 @@ jobs:
           # Distribute public key
           printf '%s\n' "${APK_SIGNING_KEY_PUB}" > site/vmvarela.rsa.pub
 
-          SIGNAME=".SIGN.RSA.vmvarela.rsa.pub"
+          # Python script: sign the gzip bytes (SHA1+RSA), then repack into a
+          # single tar.gz stream — sig entry first, then original entries.
+          # abuild-sign produces this exact format; two-stream concatenation
+          # (the previous approach) is rejected by apk-tools 3.x.
+          cat > /tmp/sign_apkindex.py << 'PYEOF'
+          import tarfile, io, subprocess, sys, os
+          key_file, pub_name, index_path = sys.argv[1], sys.argv[2], sys.argv[3]
+
+          # Sign the unsigned APKINDEX.tar.gz (gzip bytes)
+          sig_file = '/tmp/apk.sig'
+          subprocess.run(
+              ['openssl', 'dgst', '-sha1', '-sign', key_file, '-out', sig_file, index_path],
+              check=True)
+          sig = open(sig_file, 'rb').read()
+          orig = open(index_path, 'rb').read()
+
+          # Build single gzip+tar stream: .SIGN.RSA.<pubname> then original entries
+          buf = io.BytesIO()
+          with tarfile.open(fileobj=buf, mode='w:gz') as out:
+              info = tarfile.TarInfo(f'.SIGN.RSA.{pub_name}')
+              info.size = len(sig)
+              out.addfile(info, io.BytesIO(sig))
+              with tarfile.open(fileobj=io.BytesIO(orig), mode='r:gz') as src:
+                  for m in src.getmembers():
+                      data = src.extractfile(m).read()
+                      ti = tarfile.TarInfo(m.name)
+                      ti.size = len(data)
+                      out.addfile(ti, io.BytesIO(data))
+
+          open(index_path, 'wb').write(buf.getvalue())
+          print(f"Signed {index_path}: {len(buf.getvalue())} bytes")
+          PYEOF
 
           for ARCH in x86_64 aarch64; do
             INDEX="site/${ARCH}/APKINDEX.tar.gz"
-            if [ ! -f "${INDEX}" ]; then
-              continue
-            fi
-            # Alpine APK signature: SHA1+RSA signature prepended as tar.gz block
-            openssl dgst -sha1 -sign "${KEY_FILE}" -out /tmp/apk.sig "${INDEX}"
-            cp /tmp/apk.sig "/tmp/${SIGNAME}"
-            (cd /tmp && tar -czf /tmp/sig_block.tar.gz "${SIGNAME}")
-            cat /tmp/sig_block.tar.gz "${INDEX}" > "${INDEX}.signed"
-            mv "${INDEX}.signed" "${INDEX}"
-            echo "Signed APKINDEX for ${ARCH}: $(wc -c < ${INDEX}) bytes"
+            [ -f "${INDEX}" ] || continue
+            python3 /tmp/sign_apkindex.py "${KEY_FILE}" vmvarela.rsa.pub "${INDEX}"
           done
 
       - name: Create index page
