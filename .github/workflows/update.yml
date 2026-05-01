@@ -25,11 +25,6 @@ jobs:
       id-token: write
 
     steps:
-      - name: Install tools
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y apk-tools openssl
-
       - name: Resolve version
         id: vars
         run: |
@@ -49,21 +44,36 @@ jobs:
               echo "Skipped ${FILE} (not available)"
             fi
           done
-          ls -laR site/
 
-      - name: Generate APKINDEX
+      - name: Generate APKINDEX (Alpine Docker)
         run: |
+          # Write script as a file — more reliable than Docker heredoc
+          cat > /tmp/make_apkindex.sh << 'SCRIPT'
+          #!/bin/sh
+          set -e
           for ARCH in x86_64 aarch64; do
-            APKS=$(ls site/${ARCH}/*.apk 2>/dev/null || true)
-            if [ -z "${APKS}" ]; then
-              echo "No .apk in ${ARCH}, skipping"
+            APK_COUNT=$(ls /repo/${ARCH}/*.apk 2>/dev/null | wc -l)
+            if [ "${APK_COUNT}" -eq 0 ]; then
+              echo "No .apk files in ${ARCH}, skipping"
               continue
             fi
-            apk index --rewrite-arch "${ARCH}" \
-              -o "site/${ARCH}/APKINDEX.tar.gz" \
-              ${APKS}
-            echo "Created APKINDEX for ${ARCH}: $(wc -c < site/${ARCH}/APKINDEX.tar.gz) bytes"
+            apk index \
+              --rewrite-arch "${ARCH}" \
+              -o "/repo/${ARCH}/APKINDEX.tar.gz" \
+              /repo/${ARCH}/*.apk
+            echo "Created APKINDEX for ${ARCH} ($(wc -c < /repo/${ARCH}/APKINDEX.tar.gz) bytes)"
           done
+          SCRIPT
+          chmod +x /tmp/make_apkindex.sh
+
+          docker run --rm \
+            -v "${GITHUB_WORKSPACE}/site:/repo" \
+            -v "/tmp/make_apkindex.sh:/make_apkindex.sh:ro" \
+            alpine:3.21 sh /make_apkindex.sh
+
+          # Fix ownership (Docker container runs as root)
+          sudo chown -R "${USER}:${USER}" "${GITHUB_WORKSPACE}/site/"
+          ls -laR site/
 
       - name: Sign APKINDEX
         env:
@@ -79,7 +89,7 @@ jobs:
           printf '%s\n' "${APK_SIGNING_KEY}" > "${KEY_FILE}"
           chmod 600 "${KEY_FILE}"
 
-          # Write public key for user download
+          # Distribute public key
           printf '%s\n' "${APK_SIGNING_KEY_PUB}" > site/vmvarela.rsa.pub
 
           SIGNAME=".SIGN.RSA.vmvarela.rsa.pub"
@@ -89,19 +99,12 @@ jobs:
             if [ ! -f "${INDEX}" ]; then
               continue
             fi
-
-            # Sign the unsigned APKINDEX.tar.gz with SHA1+RSA (Alpine format)
-            openssl dgst -sha1 -sign "${KEY_FILE}" \
-              -out /tmp/apk.sig "${INDEX}"
-
-            # Create tar entry for the signature
+            # Alpine APK signature: SHA1+RSA signature prepended as tar.gz block
+            openssl dgst -sha1 -sign "${KEY_FILE}" -out /tmp/apk.sig "${INDEX}"
             cp /tmp/apk.sig "/tmp/${SIGNAME}"
             (cd /tmp && tar -czf /tmp/sig_block.tar.gz "${SIGNAME}")
-
-            # Prepend signature block to APKINDEX
             cat /tmp/sig_block.tar.gz "${INDEX}" > "${INDEX}.signed"
             mv "${INDEX}.signed" "${INDEX}"
-
             echo "Signed APKINDEX for ${ARCH}: $(wc -c < ${INDEX}) bytes"
           done
 
