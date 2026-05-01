@@ -46,6 +46,8 @@ jobs:
           done
 
       - name: Generate APKINDEX (Alpine Docker)
+        env:
+          APK_SIGNING_KEY_PUB: ${{ secrets.APK_SIGNING_KEY_PUB }}
         run: |
           # Write script as a file — more reliable than Docker heredoc
           cat > /tmp/make_apkindex.sh << 'SCRIPT'
@@ -66,9 +68,13 @@ jobs:
           SCRIPT
           chmod +x /tmp/make_apkindex.sh
 
+          # Trust our signing key so apk index can verify package signatures
+          printf '%s\n' "${APK_SIGNING_KEY_PUB}" > /tmp/vmvarela.rsa.pub
+
           docker run --rm \
             -v "${GITHUB_WORKSPACE}/site:/repo" \
             -v "/tmp/make_apkindex.sh:/make_apkindex.sh:ro" \
+            -v "/tmp/vmvarela.rsa.pub:/etc/apk/keys/vmvarela.rsa.pub:ro" \
             alpine:latest sh /make_apkindex.sh
 
           # Fix ownership (Docker container runs as root)
