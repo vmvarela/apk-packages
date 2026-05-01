@@ -25,6 +25,11 @@ jobs:
       id-token: write
 
     steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y apk-tools openssl
+
       - name: Resolve version
         id: vars
         run: |
@@ -46,54 +51,59 @@ jobs:
           done
           ls -laR site/
 
-      - name: Write public key
-        env:
-          APK_SIGNING_KEY_PUB: ${{ secrets.APK_SIGNING_KEY_PUB }}
+      - name: Generate APKINDEX
         run: |
-          if [ -n "${APK_SIGNING_KEY_PUB}" ]; then
-            printf '%s\n' "${APK_SIGNING_KEY_PUB}" > site/vmvarela.rsa.pub
-            echo "Public key written ($(wc -c < site/vmvarela.rsa.pub) bytes)"
-          else
-            echo "::warning::APK_SIGNING_KEY_PUB not set — skipping public key"
-          fi
+          for ARCH in x86_64 aarch64; do
+            APKS=$(ls site/${ARCH}/*.apk 2>/dev/null || true)
+            if [ -z "${APKS}" ]; then
+              echo "No .apk in ${ARCH}, skipping"
+              continue
+            fi
+            apk index --rewrite-arch "${ARCH}" \
+              -o "site/${ARCH}/APKINDEX.tar.gz" \
+              ${APKS}
+            echo "Created APKINDEX for ${ARCH}: $(wc -c < site/${ARCH}/APKINDEX.tar.gz) bytes"
+          done
 
-      - name: Generate APKINDEX and sign (Alpine Docker)
+      - name: Sign APKINDEX
         env:
           APK_SIGNING_KEY: ${{ secrets.APK_SIGNING_KEY }}
+          APK_SIGNING_KEY_PUB: ${{ secrets.APK_SIGNING_KEY_PUB }}
         run: |
-          docker run --rm \
-            -v "${{ github.workspace }}/site:/repo" \
-            -e APK_SIGNING_KEY="${APK_SIGNING_KEY}" \
-            alpine:latest sh << 'ALPINE'
-          set -e
-          apk add --no-cache abuild
+          if [ -z "${APK_SIGNING_KEY}" ]; then
+            echo "::warning::APK_SIGNING_KEY not set — APKINDEX will be unsigned"
+            exit 0
+          fi
+
+          KEY_FILE="/tmp/vmvarela.rsa"
+          printf '%s\n' "${APK_SIGNING_KEY}" > "${KEY_FILE}"
+          chmod 600 "${KEY_FILE}"
+
+          # Write public key for user download
+          printf '%s\n' "${APK_SIGNING_KEY_PUB}" > site/vmvarela.rsa.pub
+
+          SIGNAME=".SIGN.RSA.vmvarela.rsa.pub"
 
           for ARCH in x86_64 aarch64; do
-            cd /repo/${ARCH}
-            APKS=$(ls *.apk 2>/dev/null || true)
-            if [ -z "${APKS}" ]; then
-              echo "No .apk files in ${ARCH}, skipping"
-              cd /repo
+            INDEX="site/${ARCH}/APKINDEX.tar.gz"
+            if [ ! -f "${INDEX}" ]; then
               continue
             fi
 
-            if [ -n "${APK_SIGNING_KEY}" ]; then
-              KEY_FILE="/tmp/vmvarela.rsa"
-              printf '%s\n' "${APK_SIGNING_KEY}" > "${KEY_FILE}"
-              chmod 600 "${KEY_FILE}"
-              apk index --rewrite-arch ${ARCH} -o APKINDEX.tar.gz ${APKS}
-              abuild-sign -k "${KEY_FILE}" APKINDEX.tar.gz
-              echo "Signed APKINDEX for ${ARCH}"
-            else
-              apk index --rewrite-arch ${ARCH} -o APKINDEX.tar.gz ${APKS}
-              echo "::warning::APK_SIGNING_KEY not set — APKINDEX unsigned"
-            fi
-            cd /repo
-          done
-          ALPINE
+            # Sign the unsigned APKINDEX.tar.gz with SHA1+RSA (Alpine format)
+            openssl dgst -sha1 -sign "${KEY_FILE}" \
+              -out /tmp/apk.sig "${INDEX}"
 
-          # Fix permissions on files written by root inside Docker
-          sudo chown -R "$USER" site/ 2>/dev/null || true
+            # Create tar entry for the signature
+            cp /tmp/apk.sig "/tmp/${SIGNAME}"
+            (cd /tmp && tar -czf /tmp/sig_block.tar.gz "${SIGNAME}")
+
+            # Prepend signature block to APKINDEX
+            cat /tmp/sig_block.tar.gz "${INDEX}" > "${INDEX}.signed"
+            mv "${INDEX}.signed" "${INDEX}"
+
+            echo "Signed APKINDEX for ${ARCH}: $(wc -c < ${INDEX}) bytes"
+          done
 
       - name: Create index page
         run: |
