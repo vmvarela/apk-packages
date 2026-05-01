@@ -69,7 +69,7 @@ jobs:
           docker run --rm \
             -v "${GITHUB_WORKSPACE}/site:/repo" \
             -v "/tmp/make_apkindex.sh:/make_apkindex.sh:ro" \
-            alpine:3.21 sh /make_apkindex.sh
+            alpine:latest sh /make_apkindex.sh
 
           # Fix ownership (Docker container runs as root)
           sudo chown -R "${USER}:${USER}" "${GITHUB_WORKSPACE}/site/"
