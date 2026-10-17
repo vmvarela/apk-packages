@@ -59,6 +59,13 @@ jobs:
             requested="${REQUESTED_VERSION#v}"
             if [[ "$target" == "sql-pipe" ]]; then sql_pipe_version="$requested"; else ghoten_version="$requested"; fi
           fi
+          for value in "$sql_pipe_version" "$ghoten_version"; do
+            if [[ ! "$value" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::Invalid stable release version: $value"
+              exit 1
+            fi
+          done
+
           echo "target=$target" >> "$GITHUB_OUTPUT"
           echo "sql_pipe_version=$sql_pipe_version" >> "$GITHUB_OUTPUT"
           echo "ghoten_version=$ghoten_version" >> "$GITHUB_OUTPUT"
