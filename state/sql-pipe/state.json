@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "package": "sql-pipe",
+  "architectures": {
+    "x86_64": [
+      {
+        "version": "0.27.0",
+        "sha256": "4c653adab1476fcbd5c274b0fc7f1cd5956c139c4d0dd9ab52bef262c6254507",
+        "file": "sql-pipe_0.27.0_x86_64.apk"
+      }
+    ],
+    "aarch64": [
+      {
+        "version": "0.27.0",
+        "sha256": "ed9ac79cf75d9d61cbd25ba954ca00543b7964fd0f292122cea17a501e0e1306",
+        "file": "sql-pipe_0.27.0_aarch64.apk"
+      }
+    ]
+  }
+}
