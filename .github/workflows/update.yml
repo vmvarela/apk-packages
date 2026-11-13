@@ -2,12 +2,29 @@ name: Update APK Repository
 
 on:
   repository_dispatch:
-    types: [update-sql-pipe]
+    types: [update-sql-pipe, update-damas]
   workflow_dispatch:
     inputs:
-      version:
-        description: "Release version (without v, e.g. 0.7.0)"
+      package:
+        description: "Package whose release triggered the rebuild"
         required: true
+        default: sql-pipe
+        type: choice
+        options:
+          - sql-pipe
+          - damas
+      version:
+        description: "Release version without v; leave empty to use latest stable"
+        required: false
+      force:
+        description: "Rebuild and deploy even when the state already matches the release"
+        required: false
+        default: false
+        type: boolean
+
+# Publisher contract (docs/receivers.md in vmvarela/package-distribution).
+env:
+  PACKAGE_DISTRIBUTION_SHA: 3cb66b2592068fd39005823aa8d6114ab541d113
 
 concurrency:
   group: pages
@@ -21,113 +38,116 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     permissions:
+      contents: write
       pages: write
       id-token: write
 
     steps:
-      - name: Resolve version
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Check out package-distribution
+        uses: actions/checkout@v6
+        with:
+          repository: vmvarela/package-distribution
+          ref: ${{ env.PACKAGE_DISTRIBUTION_SHA }}
+          path: package-distribution
+          persist-credentials: false
+
+      - name: Resolve target and version
         id: vars
+        shell: bash
+        env:
+          EVENT_ACTION: ${{ github.event.action }}
+          INPUT_PACKAGE: ${{ github.event.inputs.package }}
+          REQUESTED_VERSION: ${{ github.event.client_payload.version || github.event.inputs.version }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          VERSION="${{ github.event.client_payload.version || github.event.inputs.version }}"
-          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          set -euo pipefail
 
-      - name: Download .apk packages
-        run: |
-          VERSION="${{ steps.vars.outputs.version }}"
-          mkdir -p site/x86_64 site/aarch64
-          for APK_ARCH in x86_64 aarch64; do
-            FILE="sql-pipe_${VERSION}_${APK_ARCH}.apk"
-            URL="https://github.com/vmvarela/sql-pipe/releases/download/v${VERSION}/${FILE}"
-            if curl -fsSL "${URL}" -o "site/${APK_ARCH}/${FILE}" 2>/dev/null; then
-              echo "Downloaded ${FILE}"
-            else
-              echo "Skipped ${FILE} (not available)"
-            fi
-          done
+          case "${EVENT_ACTION:-${INPUT_PACKAGE:-}}" in
+            update-sql-pipe|sql-pipe) target="sql-pipe" ;;
+            update-damas|damas) target="damas" ;;
+            *) echo "::error::Unknown package update event."; exit 1 ;;
+          esac
 
-      - name: Generate and sign APKINDEX (Alpine Docker)
+          catalog="package-distribution/catalog/${target}.json"
+          repo="$(jq -r '.repo' "$catalog")"
+          version="${REQUESTED_VERSION:-}"
+          version="${version#v}"
+          if [[ -z "$version" ]]; then
+            version="$(gh api "repos/${repo}/releases/latest" --jq .tag_name)"
+            version="${version#v}"
+          fi
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Not a stable release version for ${target}: ${version}"
+            exit 1
+          fi
+
+          {
+            echo "target=${target}"
+            echo "catalog=${catalog}"
+            echo "version=${version}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Publish site
+        id: publish
+        shell: bash
         env:
           APK_SIGNING_KEY: ${{ secrets.APK_SIGNING_KEY }}
           APK_SIGNING_KEY_PUB: ${{ secrets.APK_SIGNING_KEY_PUB }}
+          TARGET: ${{ steps.vars.outputs.target }}
+          VERSION: ${{ steps.vars.outputs.version }}
+          FORCE: ${{ github.event.inputs.force }}
         run: |
-          # nfpm APKs lack builddate/origin in .PKGINFO, so apk index omits t:/o:.
-          # We post-process the APKINDEX inside the container to add them.
-          # We also use abuild-sign (inside the same container) for signing because
-          # it produces the exact single-stream tar.gz format apk-tools 3.x requires.
-          if [ -n "${APK_SIGNING_KEY}" ]; then
-            printf '%s\n' "${APK_SIGNING_KEY}" > /tmp/vmvarela.rsa
-            printf '%s\n' "${APK_SIGNING_KEY_PUB}" > /tmp/vmvarela.rsa.pub
-            chmod 600 /tmp/vmvarela.rsa
+          set -euo pipefail
+          if [ -z "${APK_SIGNING_KEY}" ] || [ -z "${APK_SIGNING_KEY_PUB}" ]; then
+            echo "::error::APK_SIGNING_KEY and APK_SIGNING_KEY_PUB secrets must be configured; refusing to deploy an unsigned repository."
+            exit 1
           fi
-
-          cat > /tmp/make_apkindex.sh << 'SCRIPT'
-          #!/bin/sh
-          set -e
-          TS=$(date +%s)
-          for ARCH in x86_64 aarch64; do
-            APK_COUNT=$(ls /repo/${ARCH}/*.apk 2>/dev/null | wc -l)
-            if [ "${APK_COUNT}" -eq 0 ]; then
-              echo "No .apk files in ${ARCH}, skipping"
-              continue
-            fi
-
-            # Generate raw APKINDEX (allow-untrusted = skip package sig check)
-            apk --allow-untrusted index \
-              --description "vmvarela APK repository" \
-              --rewrite-arch "${ARCH}" \
-              -o /tmp/APKINDEX_raw.tar.gz \
-              /repo/${ARCH}/*.apk
-
-            # Extract, patch missing fields (t: and o:), repack
-            mkdir -p /tmp/apkwork && cd /tmp/apkwork
-            tar -xzf /tmp/APKINDEX_raw.tar.gz
-
-            # Add o: (origin=pkgname) and t: (build timestamp) after m: line
-            awk -v ts="${TS}" '
-              /^P:/ { pkgname=substr($0,3) }
-              /^m:/ { print; printf "o:%s\nt:%s\n", pkgname, ts; next }
-              { print }
-            ' APKINDEX > APKINDEX.new && mv APKINDEX.new APKINDEX
-
-            tar -czf "/repo/${ARCH}/APKINDEX.tar.gz" DESCRIPTION APKINDEX
-            echo "Generated APKINDEX for ${ARCH}: $(wc -c < /repo/${ARCH}/APKINDEX.tar.gz) bytes"
-            cd /
-
-            # Sign with abuild-sign (produces the exact single-stream format apk 3.x requires)
-            if [ -f /keys/vmvarela.rsa ]; then
-              abuild-sign -q \
-                -k /keys/vmvarela.rsa \
-                -p vmvarela.rsa.pub \
-                "/repo/${ARCH}/APKINDEX.tar.gz"
-              echo "Signed APKINDEX for ${ARCH}: $(wc -c < /repo/${ARCH}/APKINDEX.tar.gz) bytes"
-            else
-              echo "::warning::APK_SIGNING_KEY not set — APKINDEX will be unsigned"
-            fi
-          done
-          SCRIPT
-          chmod +x /tmp/make_apkindex.sh
-
-          # Distribute public key alongside the index
-          if [ -f /tmp/vmvarela.rsa.pub ]; then
-            cp /tmp/vmvarela.rsa.pub "${GITHUB_WORKSPACE}/site/vmvarela.rsa.pub"
-          fi
-
-          KEY_MOUNT=""
-          if [ -f /tmp/vmvarela.rsa ]; then
-            KEY_MOUNT="-v /tmp/vmvarela.rsa:/keys/vmvarela.rsa:ro -v /tmp/vmvarela.rsa.pub:/keys/vmvarela.rsa.pub:ro"
-          fi
-
+          extra=""
+          if [ "${FORCE:-false}" = "true" ]; then extra="--force"; fi
+          # apk-tools and abuild only exist on Alpine, so the publisher runs in the image it targets.
           docker run --rm \
-            -v "${GITHUB_WORKSPACE}/site:/repo" \
-            -v "/tmp/make_apkindex.sh:/make_apkindex.sh:ro" \
-            ${KEY_MOUNT} \
-            alpine:latest sh -c "apk add --quiet abuild && sh /make_apkindex.sh"
+            -e APK_SIGNING_KEY -e TARGET -e VERSION -e EXTRA="$extra" \
+            -v "$PWD/package-distribution:/publisher:ro" \
+            -v "$PWD:/work" \
+            -w /publisher \
+            alpine:latest sh -c '
+              set -eu
+              apk add --no-cache nodejs apk-tools abuild openssl tar >/dev/null
+              cd /work
+              node /publisher/scripts/apk-publish.mjs \
+                --catalog "/publisher/catalog/$TARGET.json" \
+                --version "$VERSION" \
+                --source github \
+                --out site \
+                --state state $EXTRA
+            '
+          # The container is root; the later steps and the Pages artifact must own these files.
+          if [ -d site ]; then sudo chown -R "$(id -u):$(id -g)" site site.state 2>/dev/null || true; fi
 
-          # Fix ownership (Docker container runs as root)
-          sudo chown -R "${USER}:${USER}" "${GITHUB_WORKSPACE}/site/"
-          ls -laR site/
+          if [ -f site/vmvarela.rsa.pub ]; then
+            # Rotating the key would break every client that already installed the old one.
+            printf '%s\n' "${APK_SIGNING_KEY_PUB}" > "$RUNNER_TEMP/secret.pub"
+            published="$(openssl rsa -pubin -in "$RUNNER_TEMP/secret.pub" -outform DER 2>/dev/null | openssl dgst -sha256)"
+            site_key="$(openssl rsa -pubin -in site/vmvarela.rsa.pub -outform DER 2>/dev/null | openssl dgst -sha256)"
+            if [ "$published" != "$site_key" ]; then
+              echo "::error::The published key does not match APK_SIGNING_KEY_PUB; check the pair before rotating."
+              exit 1
+            fi
+          fi
+
+          if [ -f site/.complete ]; then
+            cat site/.complete
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No change for ${TARGET} ${VERSION}; nothing to deploy."
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Create index page
+        if: steps.publish.outputs.deploy == 'true'
         run: |
           cat > site/index.html << 'HTML'
           <!DOCTYPE html>
@@ -135,25 +155,44 @@ jobs:
           <head><meta charset="utf-8"><title>vmvarela APK repository</title></head>
           <body>
           <h1>vmvarela APK repository</h1>
-          <h2>Installation (Alpine Linux)</h2>
+          <h2>Installation</h2>
           <pre>
           wget -qO /etc/apk/keys/vmvarela.rsa.pub \
             https://vmvarela.github.io/apk-packages/vmvarela.rsa.pub
           echo "https://vmvarela.github.io/apk-packages" >> /etc/apk/repositories
           apk update &amp;&amp; apk add sql-pipe
+          apk add damas
           </pre>
           </body>
           </html>
           HTML
 
-      - name: List site contents
-        run: find site/ -type f | sort
-
       - name: Upload Pages artifact
+        if: steps.publish.outputs.deploy == 'true'
         uses: actions/upload-pages-artifact@v3
         with:
           path: site/
 
       - name: Deploy to GitHub Pages
+        if: steps.publish.outputs.deploy == 'true'
         id: deployment
         uses: actions/deploy-pages@v4
+
+      - name: Record durable state
+        if: steps.publish.outputs.deploy == 'true'
+        shell: bash
+        env:
+          TARGET: ${{ steps.vars.outputs.target }}
+          VERSION: ${{ steps.vars.outputs.version }}
+        run: |
+          set -euo pipefail
+          rsync -a --delete site.state/ state/
+          git add state
+          if git diff --cached --quiet; then
+            echo "State already current."
+            exit 0
+          fi
+          git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit -m "chore(state): record ${TARGET} ${VERSION}"
+          git push origin HEAD:main
