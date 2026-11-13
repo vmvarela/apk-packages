@@ -21,6 +21,8 @@ on:
         required: false
         default: false
         type: boolean
+  schedule:
+    - cron: "37 5 * * *"
 
 # Publisher contract (docs/receivers.md in vmvarela/package-distribution).
 env:
@@ -55,6 +57,7 @@ jobs:
           persist-credentials: false
 
       - name: Resolve target and version
+        if: github.event_name != 'schedule'
         id: vars
         shell: bash
         env:
@@ -99,6 +102,7 @@ jobs:
           TARGET: ${{ steps.vars.outputs.target }}
           VERSION: ${{ steps.vars.outputs.version }}
           FORCE: ${{ github.event.inputs.force }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           if [ -z "${APK_SIGNING_KEY}" ] || [ -z "${APK_SIGNING_KEY_PUB}" ]; then
@@ -107,49 +111,91 @@ jobs:
           fi
           extra=""
           if [ "${FORCE:-false}" = "true" ]; then extra="--force"; fi
-          # apk-tools and abuild only exist on Alpine, so the publisher runs in the image it targets.
-          docker run --rm \
-            -e APK_SIGNING_KEY -e TARGET -e VERSION -e EXTRA="$extra" \
-            -v "$PWD/package-distribution:/publisher:ro" \
-            -v "$PWD:/work" \
-            -w /publisher \
-            alpine:latest sh -c '
-              set -eu
-              apk add --no-cache nodejs apk-tools abuild openssl tar >/dev/null
-              cd /work
-              node /publisher/scripts/apk-publish.mjs \
-                --catalog "/publisher/catalog/$TARGET.json" \
-                --version "$VERSION" \
-                --source github \
-                --out site \
-                --state state $EXTRA
-            '
-          # The container is root; the later steps and the Pages artifact must own these files.
-          if [ -d site ]; then sudo chown -R "$(id -u):$(id -g)" site site.state 2>/dev/null || true; fi
 
-          if [ -f site/vmvarela.rsa.pub ]; then
-            # Rotating the key would break every client that already installed the old one.
-            printf '%s\n' "${APK_SIGNING_KEY_PUB}" > "$RUNNER_TEMP/secret.pub"
-            published="$(openssl rsa -pubin -in "$RUNNER_TEMP/secret.pub" -outform DER 2>/dev/null | openssl dgst -sha256)"
-            site_key="$(openssl rsa -pubin -in site/vmvarela.rsa.pub -outform DER 2>/dev/null | openssl dgst -sha256)"
-            if [ "$published" != "$site_key" ]; then
-              echo "::error::The published key does not match APK_SIGNING_KEY_PUB; check the pair before rotating."
-              exit 1
-            fi
+          # Scheduled runs reconcile every package this channel declares; dispatch
+          # and manual runs publish the single target resolved by the step above.
+          if [ "${GITHUB_EVENT_NAME:-}" = "schedule" ]; then
+            packages=()
+            for catalog in package-distribution/catalog/*.json; do
+              if jq -e '.channels.apk' "$catalog" >/dev/null; then
+                packages+=("$(basename "$catalog" .json)")
+              fi
+            done
+          else
+            packages=("${TARGET}")
           fi
 
-          if [ -f site/.complete ]; then
-            cat site/.complete
+          state=state
+          dir=""
+          for pkg in "${packages[@]}"; do
+            if [ "${GITHUB_EVENT_NAME:-}" = "schedule" ]; then
+              repo="$(jq -r '.repo' "package-distribution/catalog/${pkg}.json")"
+              version="$(gh api "repos/${repo}/releases/latest" --jq .tag_name)"
+              version="${version#v}"
+            else
+              version="${VERSION}"
+            fi
+            if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::Not a stable release version for ${pkg}: ${version}"
+              exit 1
+            fi
+
+            out="site-${pkg}"
+            # apk-tools and abuild only exist on Alpine, so the publisher runs in the image it targets.
+            TARGET="${pkg}" VERSION="${version}" STATE="${state}" docker run --rm \
+              -e APK_SIGNING_KEY -e TARGET -e VERSION -e STATE -e EXTRA="$extra" \
+              -v "$PWD/package-distribution:/publisher:ro" \
+              -v "$PWD:/work" \
+              -w /publisher \
+              alpine:latest sh -c '
+                set -eu
+                apk add --no-cache nodejs apk-tools abuild openssl tar >/dev/null
+                cd /work
+                node /publisher/scripts/apk-publish.mjs \
+                  --catalog "/publisher/catalog/$TARGET.json" \
+                  --version "$VERSION" \
+                  --source github \
+                  --out "site-$TARGET" \
+                  --state "$STATE" $EXTRA
+              '
+            # The container is root; the later steps and the Pages artifact must own these files.
+            if [ -d "${out}" ]; then sudo chown -R "$(id -u):$(id -g)" "${out}" "${out}.state" 2>/dev/null || true; fi
+
+            if [ -f "${out}/vmvarela.rsa.pub" ]; then
+              # Rotating the key would break every client that already installed the old one.
+              printf '%s\n' "${APK_SIGNING_KEY_PUB}" > "$RUNNER_TEMP/secret.pub"
+              published="$(openssl rsa -pubin -in "$RUNNER_TEMP/secret.pub" -outform DER 2>/dev/null | openssl dgst -sha256)"
+              site_key="$(openssl rsa -pubin -in "${out}/vmvarela.rsa.pub" -outform DER 2>/dev/null | openssl dgst -sha256)"
+              if [ "$published" != "$site_key" ]; then
+                echo "::error::The published key does not match APK_SIGNING_KEY_PUB; check the pair before rotating."
+                exit 1
+              fi
+            fi
+
+            if [ -f "${out}/.complete" ]; then
+              cat "${out}/.complete"
+              dir="${out}"
+              state="${out}.state"
+            else
+              echo "No change for ${pkg} ${version}; nothing to publish."
+            fi
+          done
+
+          # The last directory that produced .complete was rebuilt from the chained
+          # state, so it already contains every earlier package update.
+          if [ -n "${dir}" ]; then
+            echo "dir=${dir}" >> "$GITHUB_OUTPUT"
             echo "deploy=true" >> "$GITHUB_OUTPUT"
           else
-            echo "No change for ${TARGET} ${VERSION}; nothing to deploy."
+            echo "No package changed; nothing to deploy."
+            echo "dir=" >> "$GITHUB_OUTPUT"
             echo "deploy=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Create index page
         if: steps.publish.outputs.deploy == 'true'
         run: |
-          cat > site/index.html << 'HTML'
+          cat > "${{ steps.publish.outputs.dir }}/index.html" << 'HTML'
           <!DOCTYPE html>
           <html lang="en">
           <head><meta charset="utf-8"><title>vmvarela APK repository</title></head>
@@ -171,7 +217,7 @@ jobs:
         if: steps.publish.outputs.deploy == 'true'
         uses: actions/upload-pages-artifact@v3
         with:
-          path: site/
+          path: ${{ steps.publish.outputs.dir }}/
 
       - name: Deploy to GitHub Pages
         if: steps.publish.outputs.deploy == 'true'
@@ -186,13 +232,15 @@ jobs:
           VERSION: ${{ steps.vars.outputs.version }}
         run: |
           set -euo pipefail
-          rsync -a --delete site.state/ state/
+          rsync -a --delete "${{ steps.publish.outputs.dir }}.state/" state/
           git add state
           if git diff --cached --quiet; then
             echo "State already current."
             exit 0
           fi
+          message="chore(state): record ${TARGET} ${VERSION}"
+          if [ "${GITHUB_EVENT_NAME:-}" = "schedule" ]; then message="chore(state): reconcile with the releases"; fi
           git -c user.name="github-actions[bot]" \
               -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
-              commit -m "chore(state): record ${TARGET} ${VERSION}"
+              commit -m "${message}"
           git push origin HEAD:main
