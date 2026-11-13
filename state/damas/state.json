@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "package": "damas",
+  "architectures": {
+    "x86_64": [
+      {
+        "version": "0.1.10",
+        "sha256": "b12acb9cc5199698879c650fc13f511751ea264a1b91c4ee19c80deadbbe0267",
+        "file": "damas_0.1.10_x86_64.apk"
+      }
+    ],
+    "aarch64": [
+      {
+        "version": "0.1.10",
+        "sha256": "14ac5144adf9d34cc41c450a13a22a94b09eacd11feadb1ede248aece214152d",
+        "file": "damas_0.1.10_aarch64.apk"
+      }
+    ]
+  }
+}
