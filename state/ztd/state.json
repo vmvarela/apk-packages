@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "package": "ztd",
+  "architectures": {
+    "x86_64": [
+      {
+        "version": "0.3.0",
+        "sha256": "f08831c19ed2421ede0330e1e04386d895f9d613ced18483aa0eeb5f8e5599e3",
+        "file": "ztd_0.3.0_x86_64.apk"
+      }
+    ],
+    "aarch64": [
+      {
+        "version": "0.3.0",
+        "sha256": "746cd9a8496b35634d3356a35eae4eee96ef1a4bcc49d9c15accf75fcfaa7dd3",
+        "file": "ztd_0.3.0_aarch64.apk"
+      }
+    ]
+  }
+}
