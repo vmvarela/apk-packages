@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "package": "zepp-life",
+  "architectures": {
+    "x86_64": [
+      {
+        "version": "0.1.0",
+        "sha256": "bfd858bf168c5052262a03e789ce614120975e536359bdb88c4ccc18487896a9",
+        "file": "zepp-life_0.1.0_x86_64.apk"
+      }
+    ],
+    "aarch64": [
+      {
+        "version": "0.1.0",
+        "sha256": "87733cec0f58ba3ca8c115862d1b75a10fca3851c638a9d00ef3af3351cc8e17",
+        "file": "zepp-life_0.1.0_aarch64.apk"
+      }
+    ]
+  }
+}
