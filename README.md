@@ -24,7 +24,7 @@ No `--allow-untrusted`: the index is signed, and Alpine trusts the packages thro
 
 ## How it is built
 
-`.github/workflows/update.yml` runs on `repository_dispatch` (`update-sql-pipe`, `update-damas`) or manually with a package and version. It checks out `package-distribution` at `PACKAGE_DISTRIBUTION_SHA`, resolves the target and version, and runs the publisher inside `alpine:latest` (apk-tools and abuild are Alpine-only). It deploys to Pages only when the state changes, then commits the candidate state back here.
+`.github/workflows/update.yml` runs on `repository_dispatch` (`update-sql-pipe`, `update-damas`, `update-ztd`) or manually with a package and version. It checks out `package-distribution` at `PACKAGE_DISTRIBUTION_SHA`, resolves the target and version, and runs the publisher inside `alpine:latest` (apk-tools and abuild are Alpine-only). It deploys to Pages only when the state changes, then commits the candidate state back here.
 
 Archived projects are not published here: `catalog/ghoten.json` has no APK channel.
 
