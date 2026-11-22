@@ -2,7 +2,7 @@ name: Update APK Repository
 
 on:
   repository_dispatch:
-    types: [update-sql-pipe, update-damas, update-ztd]
+    types: [update-sql-pipe, update-damas, update-ztd, update-zepp-life]
   workflow_dispatch:
     inputs:
       package:
@@ -14,6 +14,7 @@ on:
           - sql-pipe
           - damas
           - ztd
+          - zepp-life
       version:
         description: "Release version without v; leave empty to use latest stable"
         required: false
@@ -27,7 +28,7 @@ on:
 
 # Publisher contract (docs/receivers.md in vmvarela/package-distribution).
 env:
-  PACKAGE_DISTRIBUTION_SHA: beec0beb2a6d4cfb2252c9a37b1d939a959bae4d
+  PACKAGE_DISTRIBUTION_SHA: 5bf2717135b4c5018ec2897c9c7ad6d2bf343d3a
 
 concurrency:
   group: pages
@@ -73,6 +74,7 @@ jobs:
             update-sql-pipe|sql-pipe) target="sql-pipe" ;;
             update-damas|damas) target="damas" ;;
             update-ztd|ztd) target="ztd" ;;
+            update-zepp-life|zepp-life) target="zepp-life" ;;
             *) echo "::error::Unknown package update event."; exit 1 ;;
           esac
 
@@ -210,6 +212,7 @@ jobs:
           echo "https://vmvarela.github.io/apk-packages" >> /etc/apk/repositories
           apk update &amp;&amp; apk add sql-pipe
           apk add damas
+          apk add zepp-life
           </pre>
           </body>
           </html>

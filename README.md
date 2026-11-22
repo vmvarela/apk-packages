@@ -21,10 +21,11 @@ No `--allow-untrusted`: the index is signed, and Alpine trusts the packages thro
 |---------|-------------|
 | [sql-pipe](https://github.com/vmvarela/sql-pipe) | Read CSV from stdin, query with SQL, write CSV to stdout |
 | [damas](https://github.com/vmvarela/damas) | Draughts engine and apps (English draughts and Spanish damas) |
+| [zepp-life](https://github.com/vmvarela/zepp-life) | Sync Zepp Life activity and body measurements into a local SQLite database |
 
 ## How it is built
 
-`.github/workflows/update.yml` runs on `repository_dispatch` (`update-sql-pipe`, `update-damas`, `update-ztd`) or manually with a package and version. It checks out `package-distribution` at `PACKAGE_DISTRIBUTION_SHA`, resolves the target and version, and runs the publisher inside `alpine:latest` (apk-tools and abuild are Alpine-only). It deploys to Pages only when the state changes, then commits the candidate state back here.
+`.github/workflows/update.yml` runs on `repository_dispatch` (`update-sql-pipe`, `update-damas`, `update-ztd`, `update-zepp-life`) or manually with a package and version. It checks out `package-distribution` at `PACKAGE_DISTRIBUTION_SHA`, resolves the target and version, and runs the publisher inside `alpine:latest` (apk-tools and abuild are Alpine-only). It deploys to Pages only when the state changes, then commits the candidate state back here.
 
 Archived projects are not published here: `catalog/ghoten.json` has no APK channel.
 
